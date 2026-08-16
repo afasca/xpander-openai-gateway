@@ -577,13 +577,20 @@ def resolve_model(model: str, models: list[dict]) -> tuple[str, str] | None:
 # 提示词组装（单条 user 直接透传；多轮压缩用清晰角色标签）
 # ---------------------------------------------------------------------------
 def messages_to_prompt(messages: list[dict]) -> str:
+    """单条 user 直接透传；多轮压缩为带清晰角色标签的单条 prompt。
+    上游 invoke 只接受单条 text（协议边界），system 用强指令包装置首以提高遵从度。"""
     if len(messages) == 1 and messages[0].get("role") == "user":
         return _content_text(messages[0].get("content"))  # 直接透传，不加前缀
     parts = []
-    label = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool"}
+    systems = [_content_text(m.get("content")) for m in messages if m.get("role") == "system"]
+    if systems:
+        parts.append("【系统指令，最高优先级，必须严格遵守】\n" + "\n".join(systems))
+    label = {"user": "User", "assistant": "Assistant", "tool": "Tool"}
     for m in messages:
-        role = label.get(m.get("role", "user"), "User")
-        parts.append(f"{role}: {_content_text(m.get('content'))}")
+        role = m.get("role", "user")
+        if role == "system":
+            continue
+        parts.append(f"{label.get(role, 'User')}: {_content_text(m.get('content'))}")
     return "\n\n".join(parts)
 
 
