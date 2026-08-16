@@ -723,6 +723,55 @@ def _content_text(content) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 酒馆预设（SillyTavern preset）：网关侧注入的 system/assistant/user 提示词
+# ---------------------------------------------------------------------------
+def preset_messages() -> list[dict]:
+    """从 .env XP_PRESET 读取预设，返回 [{role, content, name}]，注入到每次请求最前面。"""
+    raw = cfg("XP_PRESET")
+    if not raw.strip():
+        return []
+    try:
+        items = json.loads(raw)
+        return [m for m in items if isinstance(m, dict) and m.get("content")
+                and m.get("role") in ("system", "user", "assistant")]
+    except Exception:
+        return []
+
+
+def parse_sillytavern_preset(text: str):
+    """解析酒馆 OpenAI 预设 JSON：提取 prompts 里启用且有内容的条目（跳过 @深度 注入条目）。
+    兼容：OpenAI messages 数组、纯文本（当作单条 system）。返回 None 表示无法解析。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return [{"role": "system", "content": text, "name": "自定义提示词"}]
+    if isinstance(data, dict) and isinstance(data.get("prompts"), list):
+        out = []
+        for p in data["prompts"]:
+            if not isinstance(p, dict):
+                continue
+            content = _content_text(p.get("content")).strip()
+            if not content or p.get("enabled") is False:
+                continue
+            if p.get("injection_position") not in (None, 0):  # 只收顶部绝对位置条目
+                continue
+            role = p.get("role") or ("system" if p.get("system_prompt") else "user")
+            if role not in ("system", "user", "assistant"):
+                role = "system"
+            out.append({"role": role, "content": content,
+                        "name": p.get("name") or p.get("identifier") or ""})
+        return out
+    if isinstance(data, list):  # OpenAI messages 数组
+        return [{"role": m.get("role") if m.get("role") in ("system", "user", "assistant") else "system",
+                 "content": _content_text(m.get("content")), "name": str(m.get("name") or "")}
+                for m in data if isinstance(m, dict) and m.get("content")]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 请求日志
 # ---------------------------------------------------------------------------
 RECENT_LOGS: list[dict] = []
@@ -814,6 +863,11 @@ async def chat_completions(req: Request):
     messages = body.get("messages") or []
     if not messages:
         return JSONResponse({"error": {"message": "messages 不能为空"}}, status_code=400)
+    # 注入网关侧预设（酒馆预设导入）：置于请求消息之前；与请求里已有的相同内容去重
+    pre = preset_messages()
+    if pre:
+        existing = {_content_text(m.get("content")) for m in messages}
+        messages = [m for m in pre if m["content"] not in existing] + messages
     stream = bool(body.get("stream"))
     model_req = body.get("model") or cfg("DEFAULT_MODEL",
                                          "amazon_bedrock/global.anthropic.claude-sonnet-5")
@@ -1196,6 +1250,33 @@ async def api_agents(req: Request):
     return {"agents": agents, "current": cfg("XP_AGENT_ID"), "default_first": agents[0]["id"] if agents else None}
 
 
+@app.get("/api/preset")
+async def api_get_preset():
+    items = preset_messages()
+    return {"count": len(items), "chars": sum(len(i["content"]) for i in items),
+            "items": [{"role": i["role"], "name": i.get("name", ""),
+                       "len": len(i["content"]), "head": i["content"][:60]} for i in items]}
+
+
+@app.post("/api/preset")
+async def api_set_preset(req: Request):
+    """导入酒馆预设：body.text = 预设 JSON / OpenAI messages 数组 / 纯文本 system。空文本=清除。"""
+    body = await req.json()
+    text = body.get("text", "")
+    if not text.strip():
+        cfg_set("XP_PRESET", "")
+        return {"ok": True, "count": 0}
+    items = parse_sillytavern_preset(text)
+    if items is None:
+        return JSONResponse({"error": "无法解析：请粘贴酒馆预设 JSON、messages 数组或纯文本"}, status_code=400)
+    if not items:
+        return JSONResponse({"error": "解析成功但没有有效条目（全部为空或被禁用）"}, status_code=400)
+    cfg_set("XP_PRESET", json.dumps(items, ensure_ascii=False))
+    return {"ok": True, "count": len(items),
+            "roles": {r: sum(1 for i in items if i["role"] == r) for r in ("system", "user", "assistant")},
+            "chars": sum(len(i["content"]) for i in items)}
+
+
 @app.post("/api/accounts/agent/retry")
 async def api_retry_agent(req: Request):
     """手动重试为某账号创建专属裸 agent。"""
@@ -1326,6 +1407,19 @@ GET  {BASE}/v1/models
       <button class="btn sm" onclick="saveAgent()">保存</button>
       <span class="muted" id="agentInfo"></span>
     </div>
+  </div>
+
+  <div class="card">
+    <h3>酒馆预设 / 人设注入</h3>
+    <p class="muted" style="margin-bottom:8px">粘贴<b>酒馆（SillyTavern）预设 JSON</b>——里面 system / assistant / user 各条目会按原顺序注入到每次请求最前面（assistant 条目作为示例对话）。也支持 OpenAI messages 数组或纯文本（当作单条 system）。<br>
+    酒馆楼层（聊天记录）不用导入：酒馆每次请求会自动带上全部历史，网关按 <code>User:/Assistant:</code> 标签完整保留（已实测 10 万字超长上下文，细节不丢）。与请求里重复的内容自动去重。</p>
+    <div class="row" style="margin-bottom:8px">
+      <input type="file" id="presetFile" accept=".json,.txt" style="max-width:260px">
+      <button class="btn sm" onclick="savePreset()">保存预设</button>
+      <button class="btn sm gray" onclick="clearPreset()">清除</button>
+    </div>
+    <textarea id="presetInput" style="min-height:110px" placeholder='粘贴酒馆预设 JSON（含 prompts 数组），或纯文本 system 提示词…'></textarea>
+    <div id="presetInfo" class="muted" style="margin-top:8px"></div>
   </div>
 </section>
 
@@ -1473,6 +1567,22 @@ async function loadAgents(){
   $('#agentInfo').textContent=d.current?'':'当前：自动（第一个）';
 }
 async function saveAgent(){await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:$('#agentSel').value})});toast('已切换智能体')}
+// ---- 酒馆预设 ----
+$('#presetFile').addEventListener('change',e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{$('#presetInput').value=r.result};r.readAsText(f)});
+async function loadPreset(){
+  const d=await api('/preset');const el=$('#presetInfo');
+  if(!d.count){el.innerHTML='当前未设置预设';return}
+  el.innerHTML=`已注入 <b>${d.count}</b> 条提示词（共 ${d.chars} 字）：<br>`+d.items.map(i=>
+    `<span class="tag ${i.role==='system'?'ok':i.role==='assistant'?'warn':''}">${i.role}</span> ${i.name||'-'} <span class="muted">(${i.len}字) ${i.head.replace(/</g,'&lt;')}…</span>`).join('<br>');
+}
+async function savePreset(){
+  const text=$('#presetInput').value;
+  const d=await api('/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+  if(d.error){toast(d.error);return}
+  toast(`已保存 ${d.count} 条预设`);$('#presetInput').value='';loadPreset();
+}
+async function clearPreset(){await api('/preset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:''})});toast('已清除');loadPreset()}
+loadPreset();
 
 let ACCS=[];
 async function loadAccounts(){
