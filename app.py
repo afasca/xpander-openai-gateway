@@ -398,14 +398,8 @@ class UpstreamError(Exception):
         self.auth = auth  # 是否鉴权类错误（401/403）
 
 
-async def fetch_agent_id(client: httpx.AsyncClient, acc: Account) -> str:
-    """自动发现 agent id（取第一个 agent，一般是 Omni）；.env XP_AGENT_ID 可覆盖。"""
-    fixed = cfg("XP_AGENT_ID")
-    if fixed:
-        return fixed
-    cached = cfg("_AGENT_ID_CACHE")
-    if cached:
-        return cached
+async def fetch_agents(client: httpx.AsyncClient, acc: Account) -> list[dict]:
+    """列出账号下的智能体（Omni + 自定义 agent）。"""
     r = await client.post(f"{SUPABASE_URL}/functions/v1/list-agents",
                           headers=auth_headers(acc), json={}, timeout=20)
     if r.status_code != 200:
@@ -413,11 +407,18 @@ async def fetch_agent_id(client: httpx.AsyncClient, acc: Account) -> str:
                             auth=r.status_code in (401, 403))
     data = r.json()
     agents = data if isinstance(data, list) else data.get("data") or data.get("agents") or []
+    return [{"id": a.get("id"), "name": a.get("name", "")} for a in agents if a.get("id")]
+
+
+async def fetch_agent_id(client: httpx.AsyncClient, acc: Account) -> str:
+    """当前生效的 agent id：.env XP_AGENT_ID 优先，否则取第一个（一般是 Omni）。"""
+    fixed = cfg("XP_AGENT_ID")
+    if fixed:
+        return fixed
+    agents = await fetch_agents(client, acc)
     if not agents:
         raise UpstreamError("该账号下没有可用智能体")
-    aid = agents[0].get("id")
-    cfg_set("_AGENT_ID_CACHE", aid)
-    return aid
+    return agents[0]["id"]
 
 
 def build_invoke_payload(prompt: str, conv_id: str | None,
@@ -1048,8 +1049,23 @@ async def api_config(req: Request):
     if "default_model" in body:
         cfg_set("DEFAULT_MODEL", body["default_model"])
     if "agent_id" in body:
-        cfg_set("_AGENT_ID_CACHE", body["agent_id"])
+        cfg_set("XP_AGENT_ID", body["agent_id"])
     return {"ok": True}
+
+
+@app.get("/api/agents")
+async def api_agents(req: Request):
+    """上游智能体列表（用于切换：Omni 人设 or 自定义纯净 agent）。"""
+    acc = POOL.acquire()
+    if not acc:
+        return JSONResponse({"error": "无可用账号"}, status_code=503)
+    async with httpx.AsyncClient() as client:
+        await POOL.ensure_token(acc, client)
+        try:
+            agents = await fetch_agents(client, acc)
+        except UpstreamError as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+    return {"agents": agents, "current": cfg("XP_AGENT_ID"), "default_first": agents[0]["id"] if agents else None}
 
 
 @app.get("/api/logs")
@@ -1154,6 +1170,16 @@ GET  {BASE}/v1/models
       <button class="btn sm" onclick="saveDefaultModel()">保存</button>
       <button class="btn sm gray" onclick="refreshModels()">刷新模型列表</button>
       <span class="muted" id="modelCacheInfo"></span>
+    </div>
+  </div>
+  <div class="card">
+    <h3>上游智能体（Agent）</h3>
+    <p class="muted" style="margin-bottom:8px">默认用第一个（一般是 Omni，自带约 5.8 万 token 人设提示词，不可被 system 覆盖）。<br>
+    如需<b>纯净模型通道</b>：在 xpander 官网创建一个无指令的自定义 Agent，然后在这里切换——内置提示词会从 ~5.8 万降到 ~2.7 万 token，人设不再锁定。</p>
+    <div class="row">
+      <select id="agentSel" style="max-width:420px"></select>
+      <button class="btn sm" onclick="saveAgent()">保存</button>
+      <span class="muted" id="agentInfo"></span>
     </div>
   </div>
 </section>
@@ -1283,6 +1309,7 @@ async function loadOverview(){
     document.querySelectorAll('#tab-overview pre')[0].innerHTML.replaceAll('{BASE}', BASE);
   loadModelList(d.default_model);
   $('#modelCacheInfo').textContent = d.models_cache_age==null?'':'缓存于 '+d.models_cache_age+' 秒前（TTL 3600s）';
+  loadAgents();
 }
 async function loadModelList(selected){
   const d = await api('/models');
@@ -1293,6 +1320,14 @@ async function loadModelList(selected){
 }
 async function refreshModels(){const d=await api('/models/refresh',{method:'POST'});toast(d.count?'已刷新，共 '+d.count+' 个模型':('刷新失败: '+(d.error||'')));loadOverview()}
 async function saveDefaultModel(){await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({default_model:$('#defaultModelSel').value})});toast('已保存默认模型')}
+async function loadAgents(){
+  const d=await api('/agents');if(d.error){$('#agentInfo').textContent=d.error;return}
+  const sel=$('#agentSel');sel.innerHTML='';
+  (d.agents||[]).forEach(a=>{const o=document.createElement('option');o.value=a.id;o.textContent=`${a.name} (${a.id.slice(0,8)})`;sel.appendChild(o)});
+  sel.value=d.current||d.default_first||'';
+  $('#agentInfo').textContent=d.current?'':'当前：自动（第一个）';
+}
+async function saveAgent(){await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:$('#agentSel').value})});toast('已切换智能体')}
 
 let ACCS=[];
 async function loadAccounts(){
