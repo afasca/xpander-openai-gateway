@@ -99,8 +99,17 @@ sudo systemctl status xpander-gateway
 ## 提示词透传规则
 
 - 单条 user 消息：**原样透传**，不加任何角色前缀；
-- 多轮历史：压缩为 `System:` / `User:` / `Assistant:` 标签拼接的单条 prompt；
-- 每次调用创建新会话（`id=null`），网关在 xpander 侧不保留会话状态。
+- 多轮历史：压缩为 `System:` / `User:` / `Assistant:` 标签拼接的单条 prompt（system 用强指令包装置首）；
+- 每次调用创建新会话（`id=null`），回答完自动删除（阅后即焚），官网会话列表不保留。
+
+## 顶替 Omni 内置提示词（纯净模型通道）
+
+Omni 智能体自带约 **5.8 万 token** 的服务端系统提示词，会锁定"我是 Omni"的人设，system 指令无法覆盖。
+解决办法：在 xpander 官网（或官方 API）创建一个**无指令的自定义 Agent**，然后在 WebUI「概览 → 上游智能体」切换过去：
+
+- 内置提示词降到约 **2.7 万 token**（残余为 xpander agent 框架自身的执行提示词，无法去除）
+- `system` 角色指令完全生效（可自定义人设）
+- 代价：自定义 Agent 默认**没有工具**（联网搜索等），需要工具时切回 Omni
 
 ## 常见问题
 
