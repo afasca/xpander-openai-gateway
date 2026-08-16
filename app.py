@@ -20,12 +20,16 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 import time
 import uuid
 from pathlib import Path
+
+log = logging.getLogger("gateway")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 import httpx
 import uvicorn
@@ -145,6 +149,8 @@ class Account:
         self.dead_until = 0.0
         self.last_error = ""
         self.last_test = None  # dict: 测试结果(余额等)
+        self.agent_id = ""     # 专属裸 agent（无内置提示词），导入后自动创建
+        self.agent_state = "pending"  # pending/creating/ok/failed
 
     @property
     def access_token(self):
@@ -171,6 +177,8 @@ class Account:
             "expires_at": self.expires_at,
             "expires_in": max(0, self.expires_at - int(time.time())),
             "last_test": self.last_test,
+            "agent_id": self.agent_id,
+            "agent_state": self.agent_state,
         }
 
 
@@ -187,12 +195,16 @@ class AccountPool:
         raw_all = cfg("XP_COOKIES")
         raws = [r for r in re.split(r"\|\|\||\\n", raw_all) if r.strip()]
         disabled_ids = {x for x in cfg("XP_DISABLED").split(",") if x}
+        agent_map = dict(x.split(":", 1) for x in cfg("XP_AGENT_MAP").split(",") if ":" in x)
         with self.lock:
             self.accounts = []
             for raw in raws:
                 try:
                     acc = Account(raw)
                     acc.disabled = acc.id in disabled_ids
+                    if agent_map.get(acc.id):
+                        acc.agent_id = agent_map[acc.id]
+                        acc.agent_state = "ok"
                     self.accounts.append(acc)
                 except Exception:
                     continue
@@ -202,6 +214,7 @@ class AccountPool:
             raw = "|||".join(encode_cookie_token(a.token) for a in self.accounts)
             cfg_set("XP_COOKIES", raw)
             cfg_set("XP_DISABLED", ",".join(a.id for a in self.accounts if a.disabled))
+            cfg_set("XP_AGENT_MAP", ",".join(f"{a.id}:{a.agent_id}" for a in self.accounts if a.agent_id))
 
     # ---- 增删 ----
     def add(self, text: str) -> dict:
@@ -214,6 +227,7 @@ class AccountPool:
                     raws.append(line)
         added, dup, bad = 0, 0, 0
         errors = []
+        new_accs = []
         with self.lock:
             have = {a.id for a in self.accounts}
             for raw in raws:
@@ -228,9 +242,12 @@ class AccountPool:
                     continue
                 have.add(acc.id)
                 self.accounts.append(acc)
+                new_accs.append(acc)
                 added += 1
         if added:
             self.persist()
+            for acc in new_accs:
+                schedule_ensure_agent(acc)  # 自动创建专属裸 agent（无内置提示词）
         return {"added": added, "duplicate": dup, "invalid": bad, "errors": errors[:5]}
 
     def remove(self, ids: list[str]) -> int:
@@ -410,8 +427,110 @@ async def fetch_agents(client: httpx.AsyncClient, acc: Account) -> list[dict]:
     return [{"id": a.get("id"), "name": a.get("name", "")} for a in agents if a.get("id")]
 
 
+AUTO_AGENT_NAME = "GW-Raw"  # 自动创建的纯净 agent 标记名（重复导入时按名复用，不会重复创建）
+
+
+async def fetch_environment_id(client: httpx.AsyncClient, acc: Account) -> str:
+    """取账号默认 environment_id（create-agent 必填）。"""
+    r = await client.get(
+        f"{SUPABASE_URL}/rest/v1/organization_environments?select=id&is_default=eq.true&limit=1",
+        headers=auth_headers(acc), timeout=20)
+    if r.status_code == 200 and r.json():
+        return r.json()[0]["id"]
+    # 兜底：从已有 agent 上取
+    agents = await fetch_agents_full(client, acc)
+    for a in agents:
+        if a.get("environment_id"):
+            return a["environment_id"]
+    raise UpstreamError("获取 environment_id 失败", auth=r.status_code in (401, 403))
+
+
+async def fetch_agents_full(client: httpx.AsyncClient, acc: Account) -> list[dict]:
+    r = await client.post(f"{SUPABASE_URL}/functions/v1/list-agents",
+                          headers=auth_headers(acc), json={}, timeout=20)
+    if r.status_code != 200:
+        raise UpstreamError(f"list-agents {r.status_code}: {r.text[:200]}", r.status_code,
+                            auth=r.status_code in (401, 403))
+    data = r.json()
+    return data if isinstance(data, list) else data.get("data") or data.get("agents") or []
+
+
+async def create_agent(client: httpx.AsyncClient, acc: Account, env_id: str) -> str:
+    """用网页端同款接口创建无内置提示词的裸 agent，返回新 agent id。"""
+    uid = (acc.token.get("user") or {}).get("id") or ""
+    r = await client.post(f"{SUPABASE_URL}/functions/v1/create-agent",
+                          headers=auth_headers(acc),
+                          json={"name": AUTO_AGENT_NAME, "icon": "xpi:flask:magenta",
+                                "environment_id": env_id, "created_by": uid,
+                                "access_scope": "personal"}, timeout=30)
+    if r.status_code not in (200, 201):
+        raise UpstreamError(f"create-agent {r.status_code}: {r.text[:200]}", r.status_code,
+                            auth=r.status_code in (401, 403))
+    d = r.json()
+    # 返回结构兼容：{id} / {agent:{id}} / {data:{id}}
+    for obj in (d, d.get("agent") or {}, d.get("data") or {}):
+        if isinstance(obj, dict) and obj.get("id"):
+            return obj["id"]
+    raise UpstreamError(f"create-agent 响应无 id: {str(d)[:200]}")
+
+
+async def ensure_agent(acc: Account):
+    """确保账号有专属裸 agent：按名字复用已有的，没有就创建；结果持久化到 XP_AGENT_MAP。"""
+    with POOL.lock:
+        if acc.agent_state == "creating":
+            return
+        acc.agent_state = "creating"
+    try:
+        async with httpx.AsyncClient() as client:
+            if not await POOL.ensure_token(acc, client):
+                raise UpstreamError("token 刷新失败")
+            agents = await fetch_agents_full(client, acc)
+            for a in agents:
+                if a.get("name") == AUTO_AGENT_NAME and a.get("id"):
+                    agent_id = a["id"]
+                    break
+            else:
+                env_id = await fetch_environment_id(client, acc)
+                agent_id = await create_agent(client, acc, env_id)
+        with POOL.lock:
+            acc.agent_id = agent_id
+            acc.agent_state = "ok"
+            acc.last_error = ""
+        POOL.persist()
+        POOL.report_success(acc)
+        log.info("账号 %s 专属 agent 就绪: %s", acc.id, agent_id)
+    except Exception as e:
+        with POOL.lock:
+            acc.agent_state = "failed"
+            acc.last_error = f"专属agent创建失败: {str(e)[:200]}"
+        log.warning("账号 %s 专属 agent 创建失败: %s", acc.id, e)
+
+
+def schedule_ensure_agent(acc: Account):
+    """在事件循环里后台执行 ensure_agent（不阻塞添加账号的响应）。"""
+    try:
+        asyncio.get_running_loop().create_task(ensure_agent(acc))
+    except RuntimeError:
+        pass  # 无事件循环（模块加载期），由 startup 统一补建
+
+
 async def fetch_agent_id(client: httpx.AsyncClient, acc: Account) -> str:
-    """当前生效的 agent id：.env XP_AGENT_ID 优先，否则取第一个（一般是 Omni）。"""
+    """当前生效的 agent id：账号专属裸 agent 优先（未就绪则同步等待创建）→ .env XP_AGENT_ID 兜底 → 第一个 agent。"""
+    if acc.agent_id:
+        return acc.agent_id
+    # 专属 agent 未就绪：同步等待创建完成，保证第一个请求也走裸 agent（不落到 Omni）
+    if acc.agent_state != "creating":
+        try:
+            await asyncio.wait_for(ensure_agent(acc), timeout=25)
+        except Exception:
+            pass
+    else:  # 另一个任务正在创建：轮询等待结果
+        for _ in range(25):
+            await asyncio.sleep(1)
+            if acc.agent_id or acc.agent_state != "creating":
+                break
+    if acc.agent_id:
+        return acc.agent_id
     fixed = cfg("XP_AGENT_ID")
     if fixed:
         return fixed
@@ -626,6 +745,15 @@ def write_log(entry: dict):
 # FastAPI 应用
 # ---------------------------------------------------------------------------
 app = FastAPI(title="xpander OpenAI 兼容网关", docs_url=None, redoc_url=None)
+
+
+@app.on_event("startup")
+async def _startup():
+    """启动时为所有缺少专属 agent 的账号后台补建（多账号同理，全自动）。"""
+    with POOL.lock:
+        accs = [a for a in POOL.accounts if not a.agent_id]
+    for acc in accs:
+        schedule_ensure_agent(acc)
 
 
 def _unauth():
@@ -1068,6 +1196,23 @@ async def api_agents(req: Request):
     return {"agents": agents, "current": cfg("XP_AGENT_ID"), "default_first": agents[0]["id"] if agents else None}
 
 
+@app.post("/api/accounts/agent/retry")
+async def api_retry_agent(req: Request):
+    """手动重试为某账号创建专属裸 agent。"""
+    body = await req.json()
+    aid = body.get("id", "")
+    with POOL.lock:
+        acc = next((a for a in POOL.accounts if a.id == aid), None)
+        if acc and acc.agent_state == "creating":
+            return {"ok": True, "state": "creating"}
+        if acc:
+            acc.agent_state = "pending"
+    if not acc:
+        return JSONResponse({"error": "账号不存在"}, status_code=404)
+    schedule_ensure_agent(acc)
+    return {"ok": True, "state": "pending"}
+
+
 @app.get("/api/logs")
 async def api_logs(req: Request):
     with LOGS_LOCK:
@@ -1174,8 +1319,8 @@ GET  {BASE}/v1/models
   </div>
   <div class="card">
     <h3>上游智能体（Agent）</h3>
-    <p class="muted" style="margin-bottom:8px">默认用第一个（一般是 Omni，自带约 5.8 万 token 人设提示词，不可被 system 覆盖）。<br>
-    如需<b>纯净模型通道</b>：在 xpander 官网创建一个无指令的自定义 Agent，然后在这里切换——内置提示词会从 ~5.8 万降到 ~2.7 万 token，人设不再锁定。</p>
+    <p class="muted" style="margin-bottom:8px"><b>全自动模式</b>：导入 Cookie 后网关会在该账号下自动创建名为 <code>GW-Raw</code> 的纯净 agent（无内置提示词，system 指令完全生效）并默认使用，多账号各自独立，无需手动选择。<br>
+    下面仅作为<b>兜底</b>：当某账号的专属 agent 创建失败时临时使用（通常是 Omni，自带人设提示词）。</p>
     <div class="row">
       <select id="agentSel" style="max-width:420px"></select>
       <button class="btn sm" onclick="saveAgent()">保存</button>
@@ -1216,7 +1361,7 @@ GET  {BASE}/v1/models
       <button class="btn sm gray" onclick="toggleSelectAll()">全选/取消</button>
     </div>
     <table>
-      <thead><tr><th></th><th>账号</th><th>Token 预览</th><th>余额</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
+      <thead><tr><th></th><th>账号</th><th>Token 预览</th><th>余额</th><th>专属 Agent</th><th>状态</th><th>启用</th><th>操作</th></tr></thead>
       <tbody id="accBody"></tbody>
     </table>
   </div>
@@ -1332,15 +1477,20 @@ async function saveAgent(){await api('/config',{method:'POST',headers:{'Content-
 let ACCS=[];
 async function loadAccounts(){
   const d=await api('/accounts');ACCS=d.accounts;
+  if(ACCS.some(a=>a.agent_state==='creating'||a.agent_state==='pending'))setTimeout(loadAccounts,3000);
   $('#accBody').innerHTML=ACCS.map(a=>{
     const bal=a.last_test&&a.last_test.ok?('$'+(a.last_test.balance_usd??'?')):'-';
     let st='';
     if(a.disabled)st='<span class="tag warn">已停用</span>';
     else if(a.dead)st='<span class="tag bad">已剔除</span>';
     else st='<span class="tag ok">正常</span>';
+    let ag='';
+    if(a.agent_state==='ok'&&a.agent_id)ag='<span class="tag ok">已创建</span><div class="muted">'+a.agent_id.slice(0,8)+'…</div>';
+    else if(a.agent_state==='creating'||a.agent_state==='pending')ag='<span class="tag warn">创建中…</span>';
+    else ag='<span class="tag bad">失败</span> <button class="btn sm gray" onclick="retryAgent(\''+a.id+'\')">重试</button>';
     return `<tr><td><input type="checkbox" class="accSel" data-id="${a.id}"></td>
     <td>${a.email||'-'}<div class="muted">ID ${a.id} · 会话剩 ${Math.round(a.expires_in/60)} 分钟</div></td>
-    <td class="muted">${a.preview}</td><td>${bal}</td><td>${st}${a.last_error?'<div class="muted" style="color:var(--bad)">'+a.last_error.slice(0,60)+'</div>':''}</td>
+    <td class="muted">${a.preview}</td><td>${bal}</td><td>${ag}</td><td>${st}${a.last_error?'<div class="muted" style="color:var(--bad)">'+a.last_error.slice(0,60)+'</div>':''}</td>
     <td><label class="switch"><input type="checkbox" ${a.disabled?'':'checked'} onchange="toggleAcc('${a.id}',this.checked)"><i></i></label></td>
     <td><button class="btn sm gray" onclick="testAcc('${a.id}',this)">测试</button>
     <button class="btn sm red" onclick="delAcc('${a.id}')">删除</button></td></tr>`}).join('')||'<tr><td colspan="7" class="muted">暂无账号，请在上方粘贴 Cookie 添加</td></tr>';
@@ -1363,6 +1513,7 @@ function toggleSelectAll(){const cbs=[...document.querySelectorAll('.accSel')];c
 async function delSelected(){const ids=[...document.querySelectorAll('.accSel:checked')].map(c=>c.dataset.id);if(!ids.length)return toast('未选中账号');
   await api('/accounts',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});loadAccounts();toast('已删除')}
 async function delAcc(id){await api('/accounts',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:[id]})});loadAccounts()}
+async function retryAgent(id){await api('/accounts/agent/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});toast('已触发重建');setTimeout(loadAccounts,3000)}
 async function toggleAcc(id,on){await api('/accounts/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,disabled:!on})});toast(on?'已启用':'已停用（重启保留）')}
 async function testAcc(id,btn){btn.disabled=true;btn.textContent='检测中…';
   const d=await api('/accounts/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
