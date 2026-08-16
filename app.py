@@ -619,10 +619,23 @@ async def delete_conversation(acc: Account, agent_id: str, conv_id: str):
     try:
         async with httpx.AsyncClient() as client:
             await POOL.ensure_token(acc, client)
-            await client.delete(f"{CHAT_BACKEND}/{agent_id}/conversations/{conv_id}",
-                                headers=auth_headers(acc), timeout=15)
-    except Exception:
-        pass
+            for attempt in range(3):
+                r = await client.delete(f"{CHAT_BACKEND}/{agent_id}/conversations/{conv_id}",
+                                        headers=auth_headers(acc), timeout=15)
+                if r.status_code in (401, 403) and attempt < 2:
+                    await POOL.refresh(acc, client)  # access_token 可能已被上游提前作废：强制刷新重试
+                    continue
+                if r.status_code >= 500 and attempt < 2:
+                    await asyncio.sleep(2)
+                    continue
+                break
+            if r.status_code in (200, 202, 204, 404):
+                log.info("阅后即焚 DELETE %s/%s -> %s", agent_id[:8], conv_id[:8], r.status_code)
+            else:
+                log.warning("阅后即焚 DELETE %s/%s -> %s %s", agent_id[:8], conv_id[:8],
+                            r.status_code, r.text[:120])
+    except Exception as e:
+        log.warning("阅后即焚失败 %s: %s", conv_id[:8], e)
 
 
 # 模型列表缓存
